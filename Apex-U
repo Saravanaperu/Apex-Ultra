@@ -1,0 +1,573 @@
+import time
+import datetime
+import os
+import sys
+import json
+import logging
+import requests
+import pandas as pd
+import numpy as np
+import pyotp
+import threading
+import uuid
+import pytz 
+import signal
+import sqlite3
+import random
+import smtplib
+import queue
+from functools import wraps
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from logging.handlers import RotatingFileHandler
+from SmartApi import SmartConnect
+
+# ==========================================
+# 1. APEX CONFIGURATION (FINAL)
+# ==========================================
+CONFIG = {
+    # --- BROKER KEYS ---
+    "API_KEY": os.getenv("API_KEY", "YOUR_API_KEY"),
+    "CLIENT_ID": os.getenv("CLIENT_ID", "YOUR_CLIENT_ID"),
+    "PASSWORD": os.getenv("PASSWORD", "YOUR_PASSWORD"),
+    "TOTP_KEY": os.getenv("TOTP_KEY", "YOUR_TOTP_KEY"),
+    
+    # --- EMAIL SETTINGS ---
+    "EMAIL_ENABLED": True,
+    "SMTP_SERVER": "smtp.gmail.com",
+    "SMTP_PORT": 587,
+    "EMAIL_SENDER": os.getenv("EMAIL_SENDER", "your_email@gmail.com"),
+    "EMAIL_PASSWORD": os.getenv("EMAIL_PASSWORD", "your_app_password"),
+    "EMAIL_RECIPIENTS": os.getenv("EMAIL_RECIPIENTS", "your_email@gmail.com").split(","),
+    "ALERT_THROTTLE": 60,
+    
+    # --- TRADING ---
+    "SYMBOL": "NIFTY",           
+    "PAPER_TRADING": True,       
+    "DB_PATH": "trading_apex_final.db",
+    "POLL_INTERVAL": 1,
+    
+    # --- SENTINEL (SAFETY) ---
+    "CRASH_PCT": 0.0035,         
+    "VOLATILITY_SPIKE": 2.0,     
+    
+    # --- RISK MANAGEMENT ---
+    "MAX_DAILY_LOSS": -1500,
+    "MAX_TRADES": 5,             
+    "CONSECUTIVE_SL_LIMIT": 3,   
+    "RISK_REDUCTION_TRIGGER": -500,
+    "MAX_SLIPPAGE_PCT": 0.08,    
+    "BROKERAGE_PER_ORDER": 20,
+    "SL_COOLDOWN": 300,          
+    
+    # --- STRATEGY ---
+    "BASE_LOTS": 1,
+    "MAX_LOTS": 2,               
+    "ADX_PERIOD": 14,
+    "ADX_THRESHOLD": 25,         
+    "TREND_SL": 0.10, "TREND_TGT": 0.25, "TREND_TRAIL": 0.35,
+    "CHOP_SL": 0.05, "CHOP_TGT": 0.08,
+    
+    "START_TIME": datetime.time(9, 15),
+    "HEALTH_PORT": 8080,
+    "API_MAX_RETRIES": 3,
+}
+
+# ==========================================
+# 2. LOGGING & METRICS
+# ==========================================
+logger = logging.getLogger("ApexBot")
+logger.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler = RotatingFileHandler("bot_apex.log", maxBytes=5*1024*1024, backupCount=5)
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+class Metrics:
+    _lock = threading.Lock()
+    start_time = time.time()
+    api_errors = 0
+    orders = 0
+    regime = "INIT"
+    
+    @classmethod
+    def set_regime(cls, r):
+        with cls._lock: cls.regime = r
+    
+    @classmethod
+    def increment_orders(cls):
+        with cls._lock: cls.orders += 1
+
+    @classmethod
+    def get_stats(cls):
+        with cls._lock:
+            return {
+                "uptime": int(time.time() - cls.start_time),
+                "regime": cls.regime,
+                "orders": cls.orders,
+                "errors": cls.api_errors
+            }
+
+# ==========================================
+# 3. NOTIFICATION SERVICE
+# ==========================================
+class NotificationService:
+    def __init__(self):
+        self.queue = queue.Queue()
+        self.last_sent = {}
+        self.worker = threading.Thread(target=self._email_worker, daemon=True)
+        self.worker.start()
+
+    def send(self, msg, critical=False):
+        prefix = "🚨 " if critical else "🔔 "
+        full_msg = f"{prefix} {msg}"
+        logger.info(full_msg)
+        
+        now = time.time()
+        if len(self.last_sent) > 1000: self.last_sent.clear()
+        
+        if msg in self.last_sent:
+            if now - self.last_sent[msg] < CONFIG["ALERT_THROTTLE"]:
+                return 
+        
+        self.last_sent[msg] = now
+
+        if CONFIG["EMAIL_ENABLED"]:
+            self.queue.put((full_msg, critical))
+
+    def _email_worker(self):
+        while True:
+            body, critical = self.queue.get()
+            try:
+                subject = f"[APEX BOT] {'CRITICAL' if critical else 'Update'}"
+                self._send_smtp(subject, body)
+            except Exception as e:
+                logger.error(f"Email Worker Failed: {e}")
+            finally:
+                self.queue.task_done()
+
+    def _send_smtp(self, subject, body):
+        try:
+            msg = MIMEMultipart()
+            msg['From'] = CONFIG["EMAIL_SENDER"]
+            msg['To'] = ", ".join(CONFIG["EMAIL_RECIPIENTS"])
+            msg['Subject'] = subject
+            msg.attach(MIMEText(body, 'plain'))
+
+            server = smtplib.SMTP(CONFIG["SMTP_SERVER"], CONFIG["SMTP_PORT"])
+            server.starttls()
+            server.login(CONFIG["EMAIL_SENDER"], CONFIG["EMAIL_PASSWORD"])
+            server.sendmail(CONFIG["EMAIL_SENDER"], CONFIG["EMAIL_RECIPIENTS"], msg.as_string())
+            server.quit()
+        except Exception as e:
+            logger.error(f"SMTP Error: {e}")
+
+notifier = NotificationService()
+
+# ==========================================
+# 4. UTILITIES & SENTINEL
+# ==========================================
+class FatalError(Exception): pass
+class NetworkError(Exception): pass
+
+def get_ist_now():
+    return datetime.datetime.now(pytz.timezone('Asia/Kolkata'))
+
+def retry(max_retries=3, delay=1):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            mtries, mdelay = max_retries, delay
+            while mtries > 0:
+                try:
+                    return func(*args, **kwargs)
+                except (requests.exceptions.RequestException, NetworkError) as e:
+                    logger.warning(f"⚠️ Retry {func.__name__}: {e}")
+                    time.sleep(mdelay)
+                    mtries -= 1
+                    mdelay *= 2 
+                except Exception as e:
+                    logger.error(f"❌ Logic Error: {e}", exc_info=True)
+                    raise e
+            raise FatalError(f"Max retries exceeded for {func.__name__}")
+        return wrapper
+    return decorator
+
+class MarketGuardian:
+    @staticmethod
+    def scan(df):
+        if df.empty: return False, ""
+        curr = df.iloc[-1]
+        
+        move = (curr['h'] - curr['l']) / curr['o']
+        if move > CONFIG["CRASH_PCT"]:
+            return True, f"FLASH CRASH: {move*100:.2f}% candle"
+            
+        avg_atr = df['atr'].rolling(20).mean().iloc[-1]
+        if avg_atr > 0 and curr['atr'] > (avg_atr * CONFIG["VOLATILITY_SPIKE"]):
+            return True, f"VOLATILITY SPIKE: {curr['atr']:.2f} vs {avg_atr:.2f}"
+            
+        if df['v'].tail(3).sum() == 0:
+            return True, "DATA FREEZE: Zero volume"
+            
+        return False, ""
+
+# ==========================================
+# 5. DATABASE & STATE
+# ==========================================
+class Database:
+    def __init__(self):
+        self.conn = sqlite3.connect(CONFIG["DB_PATH"], check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        with self.conn:
+            self.conn.execute("""CREATE TABLE IF NOT EXISTS active_trade 
+                (id INTEGER PRIMARY KEY, symbol TEXT, token TEXT, option_type TEXT, 
+                entry_price REAL, qty INTEGER, sl REAL, tgt REAL, strategy_type TEXT, 
+                start_time TEXT, highest_ltp REAL)""")
+            self.conn.execute("""CREATE TABLE IF NOT EXISTS daily_stats 
+                (date TEXT PRIMARY KEY, pnl REAL DEFAULT 0, trades_taken INTEGER DEFAULT 0, 
+                cons_sl INTEGER DEFAULT 0, disabled INTEGER DEFAULT 0, last_sl_time TEXT)""")
+
+    def save_trade(self, t):
+        with self.conn:
+            self.conn.execute("DELETE FROM active_trade")
+            if t:
+                self.conn.execute("INSERT INTO active_trade VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (t.symbol, t.token, t.option_type, t.entry_price, t.qty, t.sl, t.tgt, 
+                     t.strategy_type, str(t.start_time), t.highest_ltp))
+
+    def load_trade(self):
+        row = self.conn.execute("SELECT * FROM active_trade").fetchone()
+        if row:
+            t = TradeState(row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8])
+            t.start_time = pd.to_datetime(row[9]).replace(tzinfo=pytz.timezone('Asia/Kolkata'))
+            t.highest_ltp = row[10]
+            return t
+        return None
+
+    def get_daily_stats(self):
+        today = str(get_ist_now().date())
+        cursor = self.conn.execute("SELECT * FROM daily_stats WHERE date=?", (today,))
+        row = cursor.fetchone()
+        if row:
+            return row[1], row[2], row[3], row[4], row[5]
+        return 0, 0, 0, 0, None
+
+    def update_stats(self, pnl=0, trades=0, exit_reason=None, disable=None):
+        today = str(get_ist_now().date())
+        with self.conn:
+            row = self.conn.execute("SELECT * FROM daily_stats WHERE date=?", (today,)).fetchone()
+            if not row:
+                self.conn.execute("INSERT INTO daily_stats (date) VALUES (?)", (today,))
+                row = (today, 0, 0, 0, 0, None)
+            
+            new_pnl = row[1] + pnl
+            new_trades = row[2] + trades
+            new_sl = row[3] + 1 if exit_reason == "SL" else (0 if exit_reason in ["TARGET", "TIME"] or pnl > 0 else row[3])
+            new_dis = disable if disable is not None else row[4]
+            new_sl_time = str(get_ist_now()) if exit_reason == "SL" else row[5]
+            
+            self.conn.execute("UPDATE daily_stats SET pnl=?, trades_taken=?, cons_sl=?, disabled=?, last_sl_time=? WHERE date=?",
+                (new_pnl, new_trades, new_sl, new_dis, new_sl_time, today))
+            return new_pnl, new_trades, new_sl, new_dis, new_sl_time
+
+db = Database()
+
+class TradeState:
+    def __init__(self, symbol, token, option_type, entry_price, qty, sl, tgt, strategy_type):
+        self.symbol, self.token, self.option_type = symbol, token, option_type
+        self.entry_price, self.qty, self.sl, self.tgt = entry_price, qty, sl, tgt
+        self.strategy_type = strategy_type
+        self.start_time = get_ist_now()
+        self.highest_ltp = entry_price
+
+# ==========================================
+# 6. EXECUTION ENGINE
+# ==========================================
+class ExecutionEngine:
+    def __init__(self):
+        self.api = SmartConnect(api_key=CONFIG["API_KEY"])
+        self.instrument_df = None
+        self.ltp_cache = {}
+        self.expiry_df_cache = None
+
+    @retry()
+    def login(self):
+        totp = pyotp.TOTP(CONFIG["TOTP_KEY"]).now()
+        data = self.api.generateSession(CONFIG["CLIENT_ID"], CONFIG["PASSWORD"], totp)
+        if not data['status']: raise FatalError("Login Failed")
+        return True
+
+    @retry()
+    def load_master(self):
+        if not os.path.exists("scrip_master.json"):
+            data = requests.get("https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json").json()
+            with open("scrip_master.json", "w") as f: json.dump(data, f)
+        
+        with open("scrip_master.json", "r") as f: self.df = pd.DataFrame(json.load(f))
+        self.df['strike_val'] = pd.to_numeric(self.df['strike'], errors='coerce') / 100.0
+        self.df = self.df[self.df['exch_seg'] == 'NFO']
+        logger.info(f"Master Loaded: {len(self.df)} contracts")
+
+    def get_spot_token(self, symbol):
+        try:
+            spot_row = self.df[(self.df['name'] == symbol) & (self.df['exch_seg'] == 'NSE') & (self.df['symbol'].str.contains('-EQ'))]
+            if not spot_row.empty: return spot_row.iloc[0]['token']
+            if symbol == "NIFTY": return "99926000"
+            if symbol == "BANKNIFTY": return "99926009"
+        except: pass
+        return "99926000"
+
+    def get_ltp(self, token, symbol, force_refresh=False):
+        now = time.time()
+        if not force_refresh and token in self.ltp_cache:
+            price, ts = self.ltp_cache[token]
+            if now - ts < 1: return price
+
+        try:
+            data = self.api.ltpData("NFO", symbol, token)
+            if data['status']: 
+                price = float(data['data']['ltp'])
+                self.ltp_cache[token] = (price, now)
+                return price
+        except: pass
+        return None
+
+    def get_atm_token(self, spot, type_):
+        if self.expiry_df_cache is None:
+            subset = self.df[self.df['name'] == CONFIG["SYMBOL"]].copy()
+            subset['expiry_dt'] = pd.to_datetime(subset['expiry'], format='%d%b%Y').dt.date
+            subset = subset[subset['expiry_dt'] >= get_ist_now().date()].sort_values('expiry_dt')
+            nearest_expiry = subset.iloc[0]['expiry_dt']
+            self.expiry_df_cache = subset[subset['expiry_dt'] == nearest_expiry]
+
+        step = 50 if CONFIG["SYMBOL"] == "NIFTY" else 100
+        atm = round(spot / step) * step
+        subset = self.expiry_df_cache[self.expiry_df_cache['symbol'].str.endswith(type_)]
+        
+        if subset.empty: return None, None, None
+        try:
+            row = subset.iloc[(subset['strike_val'] - atm).abs().argsort()[:1]].iloc[0]
+            return row['token'], row['symbol'], int(row['lotsize'])
+        except: return None, None, None
+
+    def place_order(self, token, symbol, action, qty):
+        if CONFIG["PAPER_TRADING"]:
+            time.sleep(0.1)
+            ltp = self.get_ltp(token, symbol) or 100
+            noise = np.random.normal(0, 0.002) 
+            impact = 0.001 * (qty / 50) 
+            fill = ltp + (ltp * noise) + (ltp * impact * (1 if action == "BUY" else -1))
+            return f"SIM_{int(time.time())}", qty, fill
+            
+        params = {
+            "variety": "NORMAL", "tradingsymbol": symbol, "symboltoken": token,
+            "transactiontype": action, "exchange": "NFO", "ordertype": "MARKET",
+            "producttype": "INTRADAY", "duration": "DAY", "quantity": str(qty)
+        }
+        return self.api.placeOrder(params), qty, 0 
+
+# ==========================================
+# 7. STRATEGY ENGINE
+# ==========================================
+class StrategyEngine:
+    @staticmethod
+    def calculate_indicators(df):
+        df['tp'] = (df['h']+df['l']+df['c'])/3
+        df['vwap'] = (df['tp']*df['v']).cumsum()/df['v'].cumsum()
+        
+        df['sma20'] = df['c'].rolling(20).mean()
+        df['std20'] = df['c'].rolling(20).std()
+        df['upper_bb'] = df['sma20'] + 2*df['std20']
+        df['lower_bb'] = df['sma20'] - 2*df['std20']
+        
+        df['tr'] = pd.concat([df['h']-df['l'], abs(df['h']-df['c'].shift(1)), abs(df['l']-df['c'].shift(1))], axis=1).max(axis=1)
+        df['atr'] = df['tr'].ewm(span=14).mean()
+        
+        df['up'] = df['h'] - df['h'].shift(1)
+        df['dn'] = df['l'].shift(1) - df['l']
+        df['pos_dm'] = np.where((df['up'] > df['dn']) & (df['up'] > 0), df['up'], 0)
+        df['neg_dm'] = np.where((df['dn'] > df['up']) & (df['dn'] > 0), df['dn'], 0)
+        
+        df['pos_di'] = 100 * (df['pos_dm'].ewm(alpha=1/14).mean() / df['atr'])
+        df['neg_di'] = 100 * (df['neg_dm'].ewm(alpha=1/14).mean() / df['atr'])
+        df['dx'] = 100 * abs(df['pos_di'] - df['neg_di']) / (df['pos_di'] + df['neg_di'])
+        df['adx'] = df['dx'].ewm(alpha=1/14).mean()
+        return df
+
+    @staticmethod
+    def get_signal(df):
+        curr, prev = df.iloc[-2], df.iloc[-3]
+        signal, strategy, reason = None, "NONE", ""
+        
+        if curr['adx'] > CONFIG["ADX_THRESHOLD"]:
+            Metrics.set_regime("TREND")
+            if curr['c'] > curr['vwap'] and prev['c'] < prev['vwap']: 
+                signal, strategy, reason = "CE", "TREND", f"ADX {curr['adx']:.1f} | Price > VWAP"
+            elif curr['c'] < curr['vwap'] and prev['c'] > prev['vwap']: 
+                signal, strategy, reason = "PE", "TREND", f"ADX {curr['adx']:.1f} | Price < VWAP"
+        else:
+            Metrics.set_regime("CHOP")
+            if prev['c'] < prev['lower_bb'] and curr['c'] > curr['lower_bb']: 
+                signal, strategy, reason = "CE", "CHOP", "Lower BB Reversal"
+            elif prev['c'] > prev['upper_bb'] and curr['c'] < curr['upper_bb']: 
+                signal, strategy, reason = "PE", "CHOP", "Upper BB Reversal"
+        return signal, strategy, reason
+
+# ==========================================
+# 8. TRADING BOT (CONTROLLER)
+# ==========================================
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer): 
+    daemon_threads = True
+    allow_reuse_address = True
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(Metrics.get_stats()).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+class TradingBot:
+    def __init__(self):
+        for k in ["API_KEY", "CLIENT_ID", "PASSWORD", "EMAIL_PASSWORD"]: 
+            if not CONFIG.get(k) or "YOUR_" in CONFIG[k]: raise FatalError(f"Config {k} missing")
+            
+        self.engine = ExecutionEngine()
+        self.active_trade = db.load_trade()
+        self.pnl, self.trades, self.cons_sl, self.disabled, self.last_sl_time = db.get_daily_stats()
+        
+        self.server = ThreadingHTTPServer(('0.0.0.0', CONFIG["HEALTH_PORT"]), HealthHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close_trade(self, reason, ltp=0):
+        t = self.active_trade
+        oid, qty, fill = self.engine.place_order(t.token, t.symbol, "SELL", t.qty)
+        exit_price = fill if fill > 0 else ltp
+        pnl = (exit_price - t.entry_price) * t.qty
+        
+        self.pnl, _, self.cons_sl, self.disabled, self.last_sl_time = db.update_stats(pnl=pnl, exit_reason=reason)
+        notifier.send(f"Exit {t.symbol} ({reason}) PnL: {pnl:.2f}")
+        self.active_trade = None
+        db.save_trade(None)
+        
+        if self.pnl < CONFIG["MAX_DAILY_LOSS"]:
+            self.disabled = True; db.update_stats(disable=1); notifier.send("🛑 Max Loss Hit")
+
+    def run(self):
+        self.engine.login()
+        self.engine.load_master()
+        spot_token = self.engine.get_spot_token(CONFIG["SYMBOL"])
+        notifier.send(f"⚔️ Apex Ultra Final | {CONFIG['SYMBOL']} ({spot_token}) | PnL: {self.pnl}")
+        
+        last_candle_time = None
+        loop_errors = 0
+
+        while True:
+            try:
+                time.sleep(CONFIG["POLL_INTERVAL"])
+                
+                if os.path.exists("KILL_SWITCH"): notifier.send("🛑 Kill Switch"); break
+                now = get_ist_now()
+                
+                if not (CONFIG["START_TIME"] <= now.time() <= datetime.time(15, 29)):
+                    if self.active_trade: self.close_trade("EOD")
+                    continue
+                if self.disabled: continue
+
+                if self.trades >= CONFIG["MAX_TRADES"] or self.cons_sl >= CONFIG["CONSECUTIVE_SL_LIMIT"]:
+                    self.disabled = True; db.update_stats(disable=1); continue
+
+                if self.active_trade:
+                    t = self.active_trade
+                    ltp = self.engine.get_ltp(t.token, t.symbol)
+                    if not ltp: continue
+                    if ltp > t.highest_ltp: t.highest_ltp = ltp
+                    
+                    trail_cap = CONFIG["TREND_TRAIL"] if t.strategy_type == "TREND" else 0.15
+                    trail_gap = min(t.entry_price * trail_cap, (t.highest_ltp - t.entry_price) * 0.5)
+                    
+                    if (t.highest_ltp - trail_gap) > t.sl: t.sl = t.highest_ltp - trail_gap; db.save_trade(t)
+                    if (now - t.start_time).total_seconds()/60 > 45: self.close_trade("TIME", ltp)
+                    elif ltp <= t.sl: self.close_trade("SL", ltp)
+                    elif ltp >= t.tgt: self.close_trade("TGT", ltp)
+                    continue
+
+                # Check for new minute before heavy processing
+                current_minute = now.replace(second=0, microsecond=0)
+                if last_candle_time == current_minute: continue
+                
+                data = self.engine.api.getCandleData({
+                    "exchange": "NSE", "symboltoken": spot_token, "interval": "ONE_MINUTE",
+                    "fromdate": (now - datetime.timedelta(days=3)).strftime("%Y-%m-%d %H:%M"),
+                    "todate": now.strftime("%Y-%m-%d %H:%M")
+                })
+                if not data or not data.get('data'): continue
+                
+                last_candle_time = current_minute
+                loop_errors = 0 # Reset error count
+                
+                df = pd.DataFrame(data['data'], columns=['date', 'o', 'h', 'l', 'c', 'v'])
+                cols = ['o', 'h', 'l', 'c', 'v']; df[cols] = df[cols].apply(pd.to_numeric)
+                df = StrategyEngine.calculate_indicators(df)
+
+                spot_ltp = self.engine.get_ltp(spot_token, CONFIG["SYMBOL"])
+                danger, reason = MarketGuardian.scan(df)
+                if danger:
+                    notifier.send(f"🛑 SENTINEL: {reason}", critical=True)
+                    self.disabled = True; db.update_stats(disable=1); continue
+
+                if self.last_sl_time:
+                    last_sl = pd.to_datetime(self.last_sl_time).replace(tzinfo=pytz.timezone('Asia/Kolkata'))
+                    if (now - last_sl).total_seconds() < CONFIG["SL_COOLDOWN"]: continue
+
+                signal, regime, log_reason = StrategyEngine.get_signal(df)
+                
+                if signal:
+                    logger.info(f"Signal: {signal} [{regime}] | {log_reason}")
+                    token, sym, lot_size = self.engine.get_atm_token(spot_ltp, signal)
+                    ltp = self.engine.get_ltp(token, sym)
+                    if not ltp: continue
+                    
+                    fresh_ltp = self.engine.get_ltp(token, sym, force_refresh=True)
+                    if fresh_ltp and abs(fresh_ltp - ltp) / ltp > CONFIG["MAX_SLIPPAGE_PCT"]: 
+                        logger.warning("⚠️ Slippage Guard"); continue
+                    
+                    qty = lot_size * (CONFIG["MAX_LOTS"] if regime == "TREND" else CONFIG["BASE_LOTS"])
+                    if self.pnl < CONFIG["RISK_REDUCTION_TRIGGER"]: qty = lot_size
+                    
+                    sl_pct = CONFIG["TREND_SL"] if regime == "TREND" else CONFIG["CHOP_SL"]
+                    tgt_pct = CONFIG["TREND_TGT"] if regime == "TREND" else CONFIG["CHOP_TGT"]
+                    
+                    oid, qty, fill = self.engine.place_order(token, sym, "BUY", qty)
+                    if oid:
+                        fill = fill if fill > 0 else fresh_ltp
+                        sl = fill * (1 - sl_pct)
+                        tgt = fill * (1 + tgt_pct)
+                        self.active_trade = TradeState(sym, token, signal, fill, qty, sl, tgt, regime)
+                        db.save_trade(self.active_trade)
+                        db.update_stats(trades=1)
+                        Metrics.increment_orders()
+                        notifier.send(f"[{regime}] Buy {sym} @ {fill}")
+                        # Don't sleep 60, just rely on last_candle_time check to avoid double entry
+
+            except Exception as e:
+                loop_errors += 1
+                logger.error(f"Loop Error ({loop_errors}): {e}", exc_info=True)
+                if loop_errors > 5:
+                    notifier.send("🚨 Loop Instability. Hibernate 2m.", critical=True)
+                    time.sleep(120) # Hibernate
+                    loop_errors = 0 # Reset
+                time.sleep(5)
+
+if __name__ == "__main__":
+    TradingBot().run()
